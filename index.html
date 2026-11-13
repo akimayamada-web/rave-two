@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rave Two — watch together</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101114;color:#f5f5f5;font:16px system-ui, sans-serif;display:grid;min-height:100vh;place-items:center;padding:20px}
+main{width:min(760px,100%);background:#1b1d22;border:1px solid #30333b;border-radius:18px;padding:22px}
+h1{margin:0 0 5px;font-size:27px}p{color:#aeb3bf;margin:4px 0 18px}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+input,button{border:1px solid #414550;border-radius:10px;padding:12px;background:#111318;color:white;font:inherit}
+input{flex:1;min-width:160px}button{cursor:pointer;background:#6755e8;border:0;font-weight:650}button:disabled{opacity:.45;cursor:not-allowed}
+#status{font-size:14px;color:#b9c0cc;margin:12px 0}
+video{width:100%;background:#050505;border-radius:12px;max-height:60vh}
+#youtubePlayer{width:100%;aspect-ratio:16/9;background:#050505;border-radius:12px;overflow:hidden}
+#youtubePlayer iframe{width:100%;height:100%;border:0}
+.small{font-size:13px;color:#9299a7}#roomLabel{font-weight:700;color:#c9c1ff}
+</style>
+</head>
+<body>
+<main>
+  <h1>Rave Two</h1>
+  <p>Минимальная комната для совместного просмотра — максимум 2 человека.</p>
+  <div class="row">
+    <input id="room" placeholder="Код комнаты, например PARTY42" maxlength="8" autocomplete="off">
+    <button id="join">Войти</button>
+    <button id="random">Создать комнату</button>
+  </div>
+  <div id="status">Не подключено</div>
+  <div class="row">
+    <input id="url" placeholder="Ссылка на YouTube или MP4 / WebM">
+    <button id="load">Загрузить видео</button>
+  </div>
+  <div id="playerWrap"><video id="video" controls playsinline></video><div id="youtubePlayer" hidden></div></div>
+  <p class="small">Оба участника должны открыть этот сайт и ввести один код. Для первого теста используйте прямую ссылку на .mp4 или .webm. YouTube поддерживается для видео, встраивание которых разрешено. Netflix и DRM-сервисы не поддерживаются.</p>
+  <div id="roomLabel"></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const video = $("video");
+let socket, joined = false, applyingRemote = false, lastSync = 0;
+let ytPlayer = null, ytReady = false, activeMode = "file", pendingYoutubeId = null;
+let remoteActionTimer = null;
+
+function youtubeId(raw) {
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase().replace(/^www\\./, "");
+    if (host === "youtu.be") return u.pathname.split("/").filter(Boolean)[0] || null;
+    if (host === "youtube.com" || host === "m.youtube.com" || host.endsWith(".youtube.com") || host === "youtube-nocookie.com") {
+      if (u.pathname === "/watch") return u.searchParams.get("v");
+      const parts = u.pathname.split("/").filter(Boolean);
+      if (["embed", "shorts", "live"].includes(parts[0])) return parts[1] || null;
+    }
+  } catch {}
+  return null;
+}
+function loadYouTubeApi() {
+  if (window.YT && window.YT.Player) { ytReady = true; return; }
+  if (document.getElementById("yt-api")) return;
+  const script = document.createElement("script");
+  script.id = "yt-api";
+  script.src = "https://www.youtube.com/iframe_api";
+  document.head.appendChild(script);
+  window.onYouTubeIframeAPIReady = () => {
+    ytReady = true;
+    if (pendingYoutubeId) createYoutubePlayer(pendingYoutubeId);
+  };
+}
+function createYoutubePlayer(id) {
+  pendingYoutubeId = id;
+  if (!ytReady) { loadYouTubeApi(); return; }
+  activeMode = "youtube";
+  video.pause();
+  video.removeAttribute("src");
+  video.hidden = true;
+  $("youtubePlayer").hidden = false;
+  if (ytPlayer) {
+    ytPlayer.loadVideoById(id);
+    return;
+  }
+  ytPlayer = new YT.Player("youtubePlayer", {
+    width: "100%", height: "430", videoId: id,
+    playerVars: { playsinline: 1, rel: 0 },
+    events: {
+      onReady: () => { ytReady = true; },
+      onStateChange: e => {
+        if (applyingRemote) return;
+        if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.PAUSED) syncNow();
+      }
+    }
+  });
+}
+function currentTime() {
+  return activeMode === "youtube" && ytPlayer && ytPlayer.getCurrentTime ? ytPlayer.getCurrentTime() : video.currentTime;
+}
+function isPlaying() {
+  return activeMode === "youtube" && ytPlayer && ytPlayer.getPlayerState
+    ? ytPlayer.getPlayerState() === YT.PlayerState.PLAYING : !video.paused;
+}
+
+function status(s){ $("status").textContent = s; }
+function send(data){ if(socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(data)); }
+function connect(code){
+  if(socket) socket.close();
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  socket = new WebSocket(`${proto}//${location.host}`);
+  status("Подключаемся…");
+  socket.onopen = () => send({type:"join", code});
+  socket.onmessage = async event => {
+    const m = JSON.parse(event.data);
+    if(m.type === "error"){ status(m.message); return; }
+    if(m.type === "joined"){
+      joined = true; $("roomLabel").textContent = `Комната: ${m.code}`;
+      status(`В комнате ${m.count}/2 человека`);
+      if(m.videoUrl) setVideo(m.videoUrl, m.time, m.playing);
+    }
+    if(m.type === "presence") status(`В комнате ${m.count}/2 человека`);
+    if(m.type === "video"){ setVideo(m.url, 0, false); }
+    if(m.type === "sync") await applySync(m);
+  };
+  socket.onclose = () => { joined = false; status("Соединение закрыто"); };
+  socket.onerror = () => status("Ошибка соединения");
+}
+function setVideo(url, time, playing){
+  const id = youtubeId(url);
+  if (id) {
+    createYoutubePlayer(id);
+    const waitForPlayer = setInterval(() => {
+      if (ytPlayer && ytPlayer.seekTo) {
+        clearInterval(waitForPlayer);
+        applyingRemote = true;
+        try {
+          ytPlayer.loadVideoById({videoId:id, startSeconds:time || 0});
+          if (!playing) ytPlayer.pauseVideo();
+        } catch {}
+        setTimeout(()=>applyingRemote=false, 900);
+      }
+    }, 200);
+    setTimeout(()=>clearInterval(waitForPlayer), 10000);
+    return;
+  }
+  activeMode = "file";
+  $("youtubePlayer").hidden = true;
+  video.hidden = false;
+  if (ytPlayer && ytPlayer.stopVideo) { try { ytPlayer.stopVideo(); } catch {} }
+  applyingRemote = true;
+  if(video.src !== url) video.src = url;
+  video.onloadedmetadata = async () => {
+    try { video.currentTime = time || 0; if(playing) await video.play(); else video.pause(); } catch {}
+    applyingRemote = false;
+  };
+  if(video.readyState >= 1) {
+    try { video.currentTime = time || 0; if(playing) video.play().catch(()=>{}); else video.pause(); } catch {}
+    setTimeout(()=>applyingRemote=false, 300);
+  }
+}
+async function applySync(m){
+  if(activeMode === "youtube") {
+    if(!ytPlayer || !ytPlayer.getCurrentTime) return;
+    applyingRemote = true;
+    try {
+      const drift = Math.abs(ytPlayer.getCurrentTime() - m.time);
+      if (drift > 1.8) ytPlayer.seekTo(m.time, true);
+      const state = ytPlayer.getPlayerState();
+      if(m.playing && state !== YT.PlayerState.PLAYING) ytPlayer.playVideo();
+      else if(!m.playing && state !== YT.PlayerState.PAUSED) ytPlayer.pauseVideo();
+    } catch {}
+    setTimeout(()=>applyingRemote=false, 800);
+    return;
+  }
+  if(!video.src) return;
+  applyingRemote = true;
+  const drift = Math.abs(video.currentTime - m.time);
+  if(drift > 1.25) { try { video.currentTime = m.time; } catch {} }
+  try { if(m.playing && video.paused) await video.play(); else if(!m.playing && !video.paused) video.pause(); } catch {}
+  setTimeout(()=>applyingRemote=false, 250);
+}
+$("join").onclick = () => {
+  const code = $("room").value.trim().toUpperCase();
+  if(!code) return status("Введите код комнаты.");
+  connect(code);
+};
+$("random").onclick = () => {
+  const code = Math.random().toString(36).slice(2,8).toUpperCase();
+  $("room").value = code; connect(code);
+};
+$("load").onclick = () => {
+  const url = $("url").value.trim();
+  if(!joined) return status("Сначала войдите в комнату.");
+  if(!url) return status("Вставьте ссылку на видео.");
+  send({type:"video", url});
+  setVideo(url, 0, false);
+};
+function syncNow(){
+  if(!joined || applyingRemote) return;
+  if(activeMode === "youtube" && (!ytPlayer || !ytPlayer.getCurrentTime)) return;
+  if(activeMode === "file" && !video.src) return;
+  send({type:"sync", playing:isPlaying(), time:currentTime()});
+}
+video.addEventListener("play", syncNow);
+video.addEventListener("pause", syncNow);
+video.addEventListener("seeked", syncNow);
+video.addEventListener("timeupdate", () => {
+  if(Date.now()-lastSync > 2500){ lastSync=Date.now(); syncNow(); }
+});
+</script>
+</body>
+</html>
